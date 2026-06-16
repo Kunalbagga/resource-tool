@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from openpyxl import load_workbook
 from datetime import datetime, timedelta, date
 import plotly.graph_objects as go
@@ -18,15 +17,14 @@ st.set_page_config(
 # ─────────────────────────────────────────────
 
 HOURS_PER_PERSON_DAY = 10
-TODAY = date.today()
 
 DISCIPLINE_MAP = {
-    "KF-02": {"label": "Civil/Concrete",   "roles": ["Civils", "Civil Supervisor"]},
-    "KF-03": {"label": "Structural Steel", "roles": ["Boilermaker", "Boilermaker - LH", "Boilermaker  - LH", "Rigger", "Trade Assistant", "Trade Assistant - LH"]},
-    "KF-04": {"label": "Mechanical",       "roles": ["Fitter - Mechanical", "Fitter - Mechanical - LH", "Fitter - Mechanical  - LH", "Fitter - Machanical", "Fitter - Mechnical", "Trade Assistant", "Trade Assistant - LH"]},
-    "KF-05": {"label": "Piping",           "roles": ["Pipe Fitter", "PolyWelder", "Operator/Poly Welder", "polywelder", "Trade Assistant", "Trade Assistant - LH"]},
-    "KF-07": {"label": "Instrumentation",  "roles": ["Technician", "Inspector"]},
-    "KF-08": {"label": "Scaffolding",      "roles": ["Scaffolder", "Scaffolder TA", "Scaffold Supervisor"]},
+    "KF-02": {"label": "Civil",       "roles": ["Civils", "Civil Supervisor"]},
+    "KF-03": {"label": "Structural",  "roles": ["Boilermaker", "Boilermaker - LH", "Boilermaker  - LH", "Rigger", "Trade Assistant", "Trade Assistant - LH"]},
+    "KF-04": {"label": "Mechanical",  "roles": ["Fitter - Mechanical", "Fitter - Mechanical - LH", "Fitter - Mechanical  - LH", "Fitter - Machanical", "Fitter - Mechnical", "Trade Assistant", "Trade Assistant - LH"]},
+    "KF-05": {"label": "Piping",      "roles": ["Pipe Fitter", "PolyWelder", "Operator/Poly Welder", "polywelder", "Trade Assistant", "Trade Assistant - LH"]},
+    "KF-07": {"label": "Instruments", "roles": ["Technician", "Inspector"]},
+    "KF-08": {"label": "Scaffolding", "roles": ["Scaffolder", "Scaffolder TA", "Scaffold Supervisor"]},
 }
 
 SUBCONTRACTED = {
@@ -70,12 +68,12 @@ def parse_date(val):
 def week_label(dt):
     return datetime.combine(dt, datetime.min.time()).strftime("%G-W%V")
 
-def working_days_between(start, finish):
+def all_days_between(start, finish):
+    """7-day site — every calendar day counts."""
     days = []
     cur = start
     while cur <= finish:
-        if cur.weekday() < 6:
-            days.append(cur)
+        days.append(cur)
         cur += timedelta(days=1)
     return days
 
@@ -152,8 +150,14 @@ def load_roster(file_bytes):
 # ANALYSIS
 # ─────────────────────────────────────────────
 
-def build_demand(p6_df, analysis_start, analysis_end):
-    rows = []
+def build_demand(p6_df, analysis_start, analysis_end, hrs_per_day):
+    """
+    For each task, spread remaining hours evenly across all calendar days
+    (7-day site) in the remaining task window. Sum across tasks per day,
+    then AVERAGE across days in each week to get avg daily headcount needed.
+    Unit = people needed on site simultaneously on an average day that week.
+    """
+    demand_rows = []
     for _, task in p6_df.iterrows():
         disc = task["discipline"]
         if disc not in DISCIPLINE_MAP: continue
@@ -161,41 +165,42 @@ def build_demand(p6_df, analysis_start, analysis_end):
         rem_hours  = task["rem_hours"]
         if rem_hours <= 0: continue
 
-        # Only spread remaining hours over future working days (from today/analysis_start)
-        effective_start = max(task["start"], analysis_start)
-        effective_end   = min(task["finish"], analysis_end)
-        if effective_start > effective_end: continue
+        eff_start = max(task["start"], analysis_start)
+        eff_end   = min(task["finish"], analysis_end)
+        if eff_start > eff_end: continue
 
-        future_days = working_days_between(effective_start, effective_end)
+        future_days = all_days_between(eff_start, eff_end)
         if not future_days: continue
 
-        # Remaining hours spread evenly across remaining working days
-        daily_people = rem_hours / len(future_days) / HOURS_PER_PERSON_DAY
+        # People needed per day for this task
+        daily_people = rem_hours / len(future_days) / hrs_per_day
 
         for day in future_days:
-            rows.append({
-                "week":          week_label(day),
-                "discipline":    disc_label,
-                "people_demand": daily_people,
-                "activity_id":   task["activity_id"],
-                "activity_name": task["activity_name"],
-                "total_float_h": task["total_float_h"],
-                "finish":        task["finish"],
+            demand_rows.append({
+                "date":        day,
+                "week":        week_label(day),
+                "discipline":  disc_label,
+                "daily_hc":    daily_people,
             })
 
-    if not rows:
+    if not demand_rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    demand = (
-        df.groupby(["week", "discipline"])["people_demand"]
-        .sum().reset_index()
-        .rename(columns={"people_demand": "demand_headcount"})
-    )
+    df = pd.DataFrame(demand_rows)
+    # Sum all tasks per day per discipline
+    daily = df.groupby(["date", "week", "discipline"])["daily_hc"].sum().reset_index()
+    # Average across days in the week → avg daily headcount needed
+    demand = daily.groupby(["week", "discipline"])["daily_hc"].mean().reset_index()
+    demand.columns = ["week", "discipline", "demand_headcount"]
     demand["demand_headcount"] = demand["demand_headcount"].round(1)
     return demand
 
 def build_supply(roster_df):
+    """
+    Count unique people on site per day per discipline,
+    then average across days in the week → avg daily headcount available.
+    Unit = people on site simultaneously on an average day that week.
+    """
     if roster_df.empty: return pd.DataFrame()
 
     role_to_discs = {}
@@ -206,16 +211,23 @@ def build_supply(roster_df):
     expanded = []
     for _, row in roster_df.iterrows():
         for disc in role_to_discs.get(row["role"], set()):
-            expanded.append({"week": row["week"], "discipline": disc, "name": row["name"]})
+            expanded.append({
+                "date":       row["date"],
+                "week":       row["week"],
+                "discipline": disc,
+                "name":       row["name"],
+            })
 
     if not expanded: return pd.DataFrame()
 
     exp_df = pd.DataFrame(expanded)
-    supply = (
-        exp_df.groupby(["week", "discipline"])["name"]
-        .nunique().reset_index()
-        .rename(columns={"name": "supply_headcount"})
-    )
+    # Unique people per day per discipline
+    daily = exp_df.groupby(["date", "week", "discipline"])["name"].nunique().reset_index()
+    daily.columns = ["date", "week", "discipline", "daily_hc"]
+    # Average across days in the week
+    supply = daily.groupby(["week", "discipline"])["daily_hc"].mean().reset_index()
+    supply.columns = ["week", "discipline", "supply_headcount"]
+    supply["supply_headcount"] = supply["supply_headcount"].round(1)
     return supply
 
 def build_gap(demand_df, supply_df):
@@ -226,30 +238,34 @@ def build_gap(demand_df, supply_df):
     gap["status"] = gap["gap"].apply(lambda x: "✅ OK" if x >= 0 else "🔴 Short")
     return gap.sort_values(["week", "discipline"])
 
-def build_suggestions(p6_df, gap_df):
+def build_suggestions(p6_df, gap_df, hrs_per_day):
     if p6_df.empty or gap_df.empty: return []
     shortage_weeks = gap_df[gap_df["gap"] < 0][["week", "discipline", "gap"]].copy()
     if shortage_weeks.empty: return []
 
     suggestions = []
+    seen = set()
     for _, task in p6_df.iterrows():
         disc = task["discipline"]
         if disc not in DISCIPLINE_MAP: continue
         float_h = task["total_float_h"]
         if not float_h or float_h <= 0: continue
         disc_label  = DISCIPLINE_MAP[disc]["label"]
-        float_days  = round(float_h / HOURS_PER_PERSON_DAY, 1)
+        float_days  = round(float_h / hrs_per_day, 1)
         matches = shortage_weeks[shortage_weeks["discipline"] == disc_label]
         for _, short in matches.iterrows():
+            key = task["activity_id"] + short["week"]
+            if key in seen: continue
+            seen.add(key)
             suggestions.append({
-                "Shortage week":  short["week"],
-                "Discipline":     disc_label,
-                "Gap (people)":   round(abs(short["gap"]), 1),
-                "Activity ID":    task["activity_id"],
-                "Activity":       task["activity_name"][:70],
-                "Task finishes":  str(task["finish"]),
+                "Shortage week":   short["week"],
+                "Discipline":      disc_label,
+                "Gap (people/day)": round(abs(short["gap"]), 1),
+                "Activity ID":     task["activity_id"],
+                "Activity":        task["activity_name"][:70],
+                "Task finishes":   str(task["finish"]),
                 "Float avail (d)": float_days,
-                "Suggestion":     f"Can defer up to {float_days}d — may ease {short['week']} shortage",
+                "Suggestion":      f"Can defer up to {float_days}d — may ease {short['week']} shortage",
             })
     return suggestions[:60]
 
@@ -258,7 +274,7 @@ def build_suggestions(p6_df, gap_df):
 # ─────────────────────────────────────────────
 
 st.title("🏗️ ABD Resource Gap Tool")
-st.caption("Compare P6 schedule demand vs Kaefer on-site roster · flag shortages · suggest schedule adjustments")
+st.caption("P6 schedule demand vs Kaefer on-site roster · avg daily headcount · 7-day site")
 
 with st.sidebar:
     st.header("📂 Upload files")
@@ -267,10 +283,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("⚙️ Settings")
-    hrs_per_day = st.number_input("Hours per person per day", value=10, min_value=6, max_value=12)
-    HOURS_PER_PERSON_DAY = hrs_per_day
-
-    today_override = st.date_input("Analysis start date", value=TODAY)
+    hrs_per_day    = st.number_input("Hours per person per day", value=10, min_value=6, max_value=12)
+    today_override = st.date_input("Analysis start date", value=date.today())
     end_override   = st.date_input("Analysis end date",   value=date(2026, 10, 1))
 
     st.divider()
@@ -283,35 +297,30 @@ with st.sidebar:
 
 if not p6_file or not roster_file:
     st.info("👈 Upload both files in the sidebar to get started.")
-
-    st.subheader("How it works")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown("**1 · Upload**\nP6 schedule export and Kaefer roster file")
+        st.markdown("**1 · Upload**\nP6 schedule export and Kaefer roster")
     with c2:
-        st.markdown("**2 · Analyse**\nPython matches discipline → role and compares demand vs supply by week")
+        st.markdown("**2 · Analyse**\nMatches discipline → role, compares avg daily headcount demand vs supply by week")
     with c3:
-        st.markdown("**3 · Act**\nReview the heatmap, update the roster, re-upload to confirm gaps are closed")
+        st.markdown("**3 · Act**\nReview gaps, update roster, re-upload to confirm gaps closed")
     st.stop()
 
-# ─── Load data ───
+# ─── Load ───
 with st.spinner("Reading P6 schedule…"):
     p6_df = load_p6(p6_file.read())
 
 with st.spinner("Reading Kaefer roster…"):
     roster_df = load_roster(roster_file.read())
 
-analysis_start = today_override
-analysis_end   = end_override
-
 with st.spinner("Calculating gaps…"):
-    demand_df   = build_demand(p6_df, analysis_start, analysis_end)
+    demand_df   = build_demand(p6_df, today_override, end_override, hrs_per_day)
     supply_df   = build_supply(roster_df)
     gap_df      = build_gap(demand_df, supply_df)
-    suggestions = build_suggestions(p6_df, gap_df)
+    suggestions = build_suggestions(p6_df, gap_df, hrs_per_day)
 
-# ─── KPI row ───
-total_weeks    = gap_df["week"].nunique()   if not gap_df.empty else 0
+# ─── KPIs ───
+total_weeks    = gap_df["week"].nunique()        if not gap_df.empty else 0
 shortage_count = int((gap_df["gap"] < 0).sum()) if not gap_df.empty else 0
 ok_count       = int((gap_df["gap"] >= 0).sum()) if not gap_df.empty else 0
 worst_gap      = round(gap_df["gap"].min(), 1)   if not gap_df.empty else 0
@@ -320,13 +329,14 @@ k1, k2, k3, k4 = st.columns(4)
 k1.metric("Weeks in analysis",         total_weeks)
 k2.metric("Discipline-weeks ✅ OK",    ok_count)
 k3.metric("Discipline-weeks 🔴 Short", shortage_count)
-k4.metric("Worst gap (people)",        worst_gap, delta_color="inverse")
+k4.metric("Worst gap (people/day)",    worst_gap, delta_color="inverse")
 
+st.caption("ℹ️ Units: **average daily headcount** — people needed on site simultaneously on an average day that week (7-day site)")
 st.divider()
 
 # ─── Heatmap ───
 st.subheader("Resource gap heatmap")
-st.caption("Each cell = supply minus demand for that discipline-week.  **Green = surplus · Red = shortage**")
+st.caption("Each cell = avg daily supply minus avg daily demand.  **Green = surplus · Red = shortage**")
 
 if not gap_df.empty:
     pivot = gap_df.pivot_table(
@@ -349,7 +359,7 @@ if not gap_df.empty:
             [1.0,  "#14532d"],
         ],
         zmid=0,
-        colorbar=dict(title="Gap<br>(people)", thickness=14),
+        colorbar=dict(title="Gap<br>(ppl/day)", thickness=14),
     ))
     fig.update_layout(
         height=max(280, len(pivot.index) * 64 + 120),
@@ -358,13 +368,11 @@ if not gap_df.empty:
         margin=dict(l=10, r=10, t=10, b=100),
     )
     st.plotly_chart(fig, use_container_width=True)
-else:
-    st.warning("No gap data — check that both files loaded correctly.")
 
 st.divider()
 
-# ─── Demand vs Supply bar chart ───
-st.subheader("Demand vs supply by week")
+# ─── Bar chart ───
+st.subheader("Avg daily demand vs supply by week")
 
 disc_list = sorted(gap_df["discipline"].unique()) if not gap_df.empty else []
 sel_disc  = st.selectbox("Discipline", ["All disciplines"] + disc_list)
@@ -385,7 +393,7 @@ if not plot_df.empty:
     fig2.update_layout(
         barmode="group", height=360,
         xaxis=dict(tickangle=-45, tickfont=dict(size=10)),
-        yaxis=dict(title="Headcount (people)"),
+        yaxis=dict(title="Avg daily headcount (people)"),
         legend=dict(orientation="h", y=1.12),
         margin=dict(l=10, r=10, t=30, b=100),
     )
@@ -414,9 +422,9 @@ if not tbl.empty:
           .rename(columns={
               "week":             "Week",
               "discipline":       "Discipline",
-              "demand_headcount": "Demand (people)",
-              "supply_headcount": "Supply (people)",
-              "gap":              "Gap",
+              "demand_headcount": "Demand (ppl/day)",
+              "supply_headcount": "Supply (ppl/day)",
+              "gap":              "Gap (ppl/day)",
               "status":           "Status",
           }),
         use_container_width=True, hide_index=True,
@@ -426,30 +434,28 @@ else:
 
 st.divider()
 
-# ─── Schedule adjustment suggestions ───
+# ─── Suggestions ───
 st.subheader("📋 Schedule adjustment suggestions")
 st.caption("Tasks with positive float that could be deferred to ease shortage weeks. Verify against critical path before acting.")
 
 if suggestions:
-    sug_df = (
-        pd.DataFrame(suggestions)
-        .drop_duplicates(subset=["Activity ID", "Shortage week"])
-        .sort_values(["Shortage week", "Gap (people)"], ascending=[True, False])
+    st.dataframe(
+        pd.DataFrame(suggestions).sort_values(["Shortage week", "Gap (people/day)"], ascending=[True, False]),
+        use_container_width=True, hide_index=True,
     )
-    st.dataframe(sug_df, use_container_width=True, hide_index=True)
 else:
-    st.info("No float-based suggestions — either no shortages exist or no tasks have positive float.")
+    st.info("No float-based suggestions — either no shortages or no tasks have positive float.")
 
 st.divider()
 
-# ─── Subcontracted note ───
+# ─── Excluded ───
 st.subheader("ℹ️ Excluded disciplines")
 for code, label in SUBCONTRACTED.items():
     st.caption(f"• **{code}** — {label}")
 
 st.divider()
 
-# ─── Raw data expanders ───
+# ─── Raw data ───
 with st.expander("🔍 P6 tasks loaded"):
     st.dataframe(
         p6_df[["activity_id","activity_name","status","start","finish","rem_hours","discipline","total_float_h"]]
